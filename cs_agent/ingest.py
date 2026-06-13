@@ -6,8 +6,13 @@ restart, an already-populated Redis index is reused as-is (the redis container
 outlives cs-agent restarts); only a fresh/incomplete index is (re)built. When a
 build does embed, results load from the pre-baked cache (kb/embeddings.json)
 when present, else fall back to live embedding (and are written back to that
-cache); without model credentials the index is BM25-only. Set KB_FORCE_REINDEX=1
-to always rebuild."""
+cache); without model credentials the index is BM25-only.
+
+Embeddings are SKIPPED entirely (BM25-only, ~instant startup, no Vertex calls)
+when KB_SKIP_EMBEDDINGS is set, or by default when CS_RETRIEVAL_MODE=bm25_primary
+(the default) -- vector search is then only a last resort. Set
+KB_SKIP_EMBEDDINGS=0 to force embedding, or KB_FORCE_REINDEX=1 to always rebuild.
+Live embedding logs per-batch progress; tune batch size with KB_EMBED_BATCH_SIZE."""
 
 import base64
 import json
@@ -20,13 +25,35 @@ import redis
 from redis.commands.search.field import TextField, VectorField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 
-from rag_tools import DOC_PREFIX, EMBEDDING_DIM, KB_INDEX, REDIS_URL, _embed
+from rag_tools import (
+    DOC_PREFIX,
+    EMBEDDING_DIM,
+    EMBEDDING_MODEL,
+    KB_INDEX,
+    REDIS_URL,
+    _embed,
+)
 
 KB_DOCUMENTS_DIR = Path(os.environ.get("KB_DOCUMENTS_DIR", "/app/kb/documents"))
 # Pre-baked {doc_id: base64(float32)} cache (see precompute_embeddings.py).
 KB_EMBEDDINGS_PATH = Path(os.environ.get("KB_EMBEDDINGS_PATH", "/app/kb/embeddings.json"))
 
-EMBED_BATCH_SIZE = 25
+EMBED_BATCH_SIZE = int(os.environ.get("KB_EMBED_BATCH_SIZE", "25"))
+
+
+def _should_skip_embeddings() -> bool:
+    """Whether to build the index BM25-only (no Vertex embedding calls).
+
+    KB_SKIP_EMBEDDINGS=1/true forces skipping; =0/false forces embedding;
+    unset/"auto" (default) ties it to the retrieval mode: skip when
+    CS_RETRIEVAL_MODE=bm25_primary (the default), embed in legacy mode.
+    """
+    val = os.environ.get("KB_SKIP_EMBEDDINGS", "auto").lower()
+    if val in ("1", "true", "yes"):
+        return True
+    if val in ("0", "false", "no"):
+        return False
+    return os.environ.get("CS_RETRIEVAL_MODE", "bm25_primary").lower() == "bm25_primary"
 
 
 def load_embedding_cache() -> dict[str, bytes]:
@@ -47,13 +74,15 @@ def load_documents() -> list[dict]:
     return docs
 
 
-def _index_has_all_embeddings(client: redis.Redis, documents: list[dict]) -> bool:
-    """True if Redis already holds every document WITH an embedding.
+def _index_is_complete(
+    client: redis.Redis, documents: list[dict], *, require_embedding: bool
+) -> bool:
+    """True if Redis already holds every document, so a restart can reuse it.
 
-    Lets a restart reuse the embeddings already in Redis instead of
-    re-embedding from scratch. A doc whose hash or 'embedding' field is missing
-    forces a rebuild, so this returns False for an empty, partial, or
-    BM25-only index.
+    With require_embedding=True every doc must also carry an 'embedding' field
+    (so we never reuse a partial or BM25-only index when embeddings are wanted).
+    With require_embedding=False only the doc hashes need to exist (used when
+    embeddings are skipped). Any missing doc forces a rebuild.
     """
     try:
         client.ft(KB_INDEX).info()
@@ -61,8 +90,53 @@ def _index_has_all_embeddings(client: redis.Redis, documents: list[dict]) -> boo
         return False  # index does not exist yet
     pipe = client.pipeline(transaction=False)
     for doc in documents:
-        pipe.hexists(f"{DOC_PREFIX}{doc['id']}", "embedding")
+        key = f"{DOC_PREFIX}{doc['id']}"
+        if require_embedding:
+            pipe.hexists(key, "embedding")
+        else:
+            pipe.exists(key)
     return all(pipe.execute())
+
+
+def _embed_misses(
+    documents: list[dict], embedding_bytes: list[bytes | None], misses: list[int]
+) -> None:
+    """Live-embed the cache-miss documents in batches, logging per-batch progress.
+
+    Embedding via Vertex is slow (~10s+/call), so a flushed progress line is
+    emitted after every batch -- otherwise the multi-minute embed looks like a
+    hang. Lower KB_EMBED_BATCH_SIZE for finer-grained progress (more API calls).
+    Failures leave the affected docs BM25-only rather than aborting the build.
+    """
+    total = len(misses)
+    print(
+        f"[ingest] embedding {total} documents via {EMBEDDING_MODEL} "
+        f"in batches of {EMBED_BATCH_SIZE}...",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        for start in range(0, total, EMBED_BATCH_SIZE):
+            idx = misses[start : start + EMBED_BATCH_SIZE]
+            vectors = _embed(
+                [f"{documents[i]['title']}\n{documents[i]['content']}" for i in idx]
+            )
+            for i, vector in zip(idx, vectors):
+                embedding_bytes[i] = struct.pack(f"{EMBEDDING_DIM}f", *vector)
+            done = min(start + EMBED_BATCH_SIZE, total)
+            print(
+                f"[ingest] embedded {done}/{total} documents ({done * 100 // total}%)",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as e:
+        done = sum(1 for i in misses if embedding_bytes[i] is not None)
+        print(
+            f"[ingest] embeddings unavailable ({e}); {done}/{total} embedded before "
+            "failure -- the rest will be BM25-only (kb_search_bm25 still works)",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _persist_embedding_cache(documents: list[dict], embedding_bytes: list[bytes | None]) -> None:
@@ -78,17 +152,18 @@ def _persist_embedding_cache(documents: list[dict], embedding_bytes: list[bytes 
     try:
         KB_EMBEDDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         KB_EMBEDDINGS_PATH.write_text(json.dumps(have))
-        print(f"[ingest] wrote {len(have)} embeddings to {KB_EMBEDDINGS_PATH}", file=sys.stderr)
+        print(f"[ingest] wrote {len(have)} embeddings to {KB_EMBEDDINGS_PATH}", file=sys.stderr, flush=True)
     except OSError as e:
-        print(f"[ingest] could not persist embedding cache ({e})", file=sys.stderr)
+        print(f"[ingest] could not persist embedding cache ({e})", file=sys.stderr, flush=True)
 
 
 def build_index() -> None:
     """(Re)create the KB index and load every document, embedding if possible.
 
-    Reuses an already-populated Redis index when every document is present with
-    an embedding (no re-embedding on restart). Set KB_FORCE_REINDEX=1 to force a
-    full rebuild (e.g. after editing documents).
+    Reuses an already-populated Redis index (no rebuild on restart). Embeddings
+    are skipped when KB_SKIP_EMBEDDINGS is set or CS_RETRIEVAL_MODE=bm25_primary
+    (the default), giving a BM25-only, ~instant startup. Set KB_FORCE_REINDEX=1
+    to force a full rebuild (e.g. after editing documents).
     """
     client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
     documents = load_documents()
@@ -96,11 +171,17 @@ def build_index() -> None:
         raise RuntimeError(f"No KB documents found in {KB_DOCUMENTS_DIR}")
 
     force = os.environ.get("KB_FORCE_REINDEX", "").lower() in ("1", "true", "yes")
-    if not force and _index_has_all_embeddings(client, documents):
+    skip_embeddings = _should_skip_embeddings()
+
+    if not force and _index_is_complete(
+        client, documents, require_embedding=not skip_embeddings
+    ):
+        kind = "BM25-only" if skip_embeddings else "embedded"
         print(
             f"[ingest] reusing existing Redis index: {len(documents)} documents "
-            "already embedded (set KB_FORCE_REINDEX=1 to rebuild)",
+            f"({kind}); skipping rebuild (KB_FORCE_REINDEX=1 to rebuild)",
             file=sys.stderr,
+            flush=True,
         )
         return
 
@@ -122,30 +203,29 @@ def build_index() -> None:
         definition=IndexDefinition(prefix=[DOC_PREFIX], index_type=IndexType.HASH),
     )
 
-    # Pre-baked cache first; live-embed only the misses (BM25-only if neither).
-    cache = load_embedding_cache()
-    embedding_bytes: list[bytes | None] = [cache.get(d["id"]) for d in documents]
-    misses = [i for i, b in enumerate(embedding_bytes) if b is None]
-    if cache:
+    embedding_bytes: list[bytes | None] = [None] * len(documents)
+    misses: list[int] = []
+    if skip_embeddings:
         print(
-            f"[ingest] embedding cache hit for {len(documents) - len(misses)}/"
-            f"{len(documents)} documents",
+            f"[ingest] embeddings skipped (BM25-only); indexing {len(documents)} "
+            "documents -- set KB_SKIP_EMBEDDINGS=0 to embed",
             file=sys.stderr,
+            flush=True,
         )
-    if misses:
-        try:
-            for start in range(0, len(misses), EMBED_BATCH_SIZE):
-                idx = misses[start : start + EMBED_BATCH_SIZE]
-                vectors = _embed([f"{documents[i]['title']}\n{documents[i]['content']}" for i in idx])
-                for i, vector in zip(idx, vectors):
-                    embedding_bytes[i] = struct.pack(f"{EMBEDDING_DIM}f", *vector)
-            print(f"[ingest] live-embedded {len(misses)} uncached documents", file=sys.stderr)
-        except Exception as e:
+    else:
+        # Pre-baked cache first; live-embed only the misses (BM25-only if neither).
+        cache = load_embedding_cache()
+        embedding_bytes = [cache.get(d["id"]) for d in documents]
+        misses = [i for i, b in enumerate(embedding_bytes) if b is None]
+        if cache:
             print(
-                f"[ingest] embeddings unavailable ({e}); {len(misses)} doc(s) "
-                "will be BM25-only (kb_search_bm25 still works)",
+                f"[ingest] embedding cache hit for {len(documents) - len(misses)}/"
+                f"{len(documents)} documents",
                 file=sys.stderr,
+                flush=True,
             )
+        if misses:
+            _embed_misses(documents, embedding_bytes, misses)
 
     pipe = client.pipeline(transaction=False)
     for doc, emb in zip(documents, embedding_bytes):
@@ -154,7 +234,7 @@ def build_index() -> None:
             mapping["embedding"] = emb
         pipe.hset(f"{DOC_PREFIX}{doc['id']}", mapping=mapping)
     pipe.execute()
-    print(f"[ingest] indexed {len(documents)} documents into {KB_INDEX}", file=sys.stderr)
+    print(f"[ingest] indexed {len(documents)} documents into {KB_INDEX}", file=sys.stderr, flush=True)
 
     # Save newly computed embeddings so the next cold start can skip embedding.
     if misses:
