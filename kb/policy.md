@@ -61,5 +61,11 @@ Here are some concrete examples:
 * Discussing specific loan or credit details
 * Filing a dispute on behalf of the user
 
-To verify the identity of the user, call the appropriate read tools, and ensure that they are able to give correctly any 2 out of the following values: date of birth, email, phone number, address. Knowing full name or userID is not enough to verify. After verification, you must call the verification logging tool to properly log the information into the verification records. Do not leak any information about the user before they are verified.
+To verify a user's identity:
+
+1. Verify only when you must access or modify their information, and at most once per conversation.
+2. Call the appropriate read tool(s) to fetch the user's true on-file values.
+3. Have the user provide identifying details and confirm that at least **2** of these match the record: date of birth, email, phone number, address. Full name or user ID do NOT count toward the two.
+4. Only after a successful match, call the verification logging tool exactly once, using the user's exact on-file values and the current time from `get_current_time()` (never a guessed or assumed time).
+5. Do not reveal any account or customer information before verification succeeds.
 
