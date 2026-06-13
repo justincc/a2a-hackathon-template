@@ -45,7 +45,7 @@ The knowledge base may contain references to specialized internal tools that you
 
 **How to use agent discoverable tools:**
 1. First, unlock the tool using `unlock_discoverable_agent_tool(agent_tool_name)` with the exact tool name from the knowledge base: you must unlock the tool before using it to get information on the proper params. IMPORTANT: Do not unlock tools that you do not plan on actually using: this causes issues in database logging.
-2. Then, call the tool using `call_discoverable_agent_tool(agent_tool_name, arguments)` with the required arguments
+2. Then, call the tool using `call_discoverable_agent_tool(agent_tool_name, arguments)`. The `arguments` must exactly match the parameter schema the unlock step returned: use those exact parameter names and copy each value (ids, amounts, account classes, product names, dates) verbatim from the customer or knowledge base. Do not guess, reformat, abbreviate, or invent argument values — wrong arguments make the action incorrect even when the tool name is right.
 3. The unlock step is required before calling - you cannot call a tool that hasn't been unlocked
 
 ### Authenticating Users
