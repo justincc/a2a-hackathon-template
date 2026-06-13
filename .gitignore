@@ -1,5 +1,6 @@
 .env
 __pycache__/
+.claude/
 
 # Generated embedding cache (regenerate with cs_agent/precompute_embeddings.py)
 kb/embeddings.json
