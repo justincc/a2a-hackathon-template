@@ -1,9 +1,13 @@
 """Build the Redis knowledge-base index from kb/documents at startup.
 
 Runs before the agent is served (main.py imports it), so the agent card only
-becomes available once the index is ready. Embeddings load from the pre-baked
-cache (kb/embeddings.json) when present, else fall back to live embedding;
-without model credentials the index is BM25-only."""
+becomes available once the index is ready. To avoid re-embedding on every
+restart, an already-populated Redis index is reused as-is (the redis container
+outlives cs-agent restarts); only a fresh/incomplete index is (re)built. When a
+build does embed, results load from the pre-baked cache (kb/embeddings.json)
+when present, else fall back to live embedding (and are written back to that
+cache); without model credentials the index is BM25-only. Set KB_FORCE_REINDEX=1
+to always rebuild."""
 
 import base64
 import json
@@ -43,12 +47,62 @@ def load_documents() -> list[dict]:
     return docs
 
 
+def _index_has_all_embeddings(client: redis.Redis, documents: list[dict]) -> bool:
+    """True if Redis already holds every document WITH an embedding.
+
+    Lets a restart reuse the embeddings already in Redis instead of
+    re-embedding from scratch. A doc whose hash or 'embedding' field is missing
+    forces a rebuild, so this returns False for an empty, partial, or
+    BM25-only index.
+    """
+    try:
+        client.ft(KB_INDEX).info()
+    except redis.ResponseError:
+        return False  # index does not exist yet
+    pipe = client.pipeline(transaction=False)
+    for doc in documents:
+        pipe.hexists(f"{DOC_PREFIX}{doc['id']}", "embedding")
+    return all(pipe.execute())
+
+
+def _persist_embedding_cache(documents: list[dict], embedding_bytes: list[bytes | None]) -> None:
+    """Best-effort: write computed embeddings back to KB_EMBEDDINGS_PATH so a
+    future cold start (fresh Redis) can load them instead of re-embedding."""
+    have = {
+        doc["id"]: base64.b64encode(emb).decode()
+        for doc, emb in zip(documents, embedding_bytes)
+        if emb is not None
+    }
+    if not have:
+        return
+    try:
+        KB_EMBEDDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        KB_EMBEDDINGS_PATH.write_text(json.dumps(have))
+        print(f"[ingest] wrote {len(have)} embeddings to {KB_EMBEDDINGS_PATH}", file=sys.stderr)
+    except OSError as e:
+        print(f"[ingest] could not persist embedding cache ({e})", file=sys.stderr)
+
+
 def build_index() -> None:
-    """(Re)create the KB index and load every document, embedding if possible."""
+    """(Re)create the KB index and load every document, embedding if possible.
+
+    Reuses an already-populated Redis index when every document is present with
+    an embedding (no re-embedding on restart). Set KB_FORCE_REINDEX=1 to force a
+    full rebuild (e.g. after editing documents).
+    """
     client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
     documents = load_documents()
     if not documents:
         raise RuntimeError(f"No KB documents found in {KB_DOCUMENTS_DIR}")
+
+    force = os.environ.get("KB_FORCE_REINDEX", "").lower() in ("1", "true", "yes")
+    if not force and _index_has_all_embeddings(client, documents):
+        print(
+            f"[ingest] reusing existing Redis index: {len(documents)} documents "
+            "already embedded (set KB_FORCE_REINDEX=1 to rebuild)",
+            file=sys.stderr,
+        )
+        return
 
     try:
         client.ft(KB_INDEX).dropindex(delete_documents=True)
@@ -101,6 +155,10 @@ def build_index() -> None:
         pipe.hset(f"{DOC_PREFIX}{doc['id']}", mapping=mapping)
     pipe.execute()
     print(f"[ingest] indexed {len(documents)} documents into {KB_INDEX}", file=sys.stderr)
+
+    # Save newly computed embeddings so the next cold start can skip embedding.
+    if misses:
+        _persist_embedding_cache(documents, embedding_bytes)
 
 
 if __name__ == "__main__":
