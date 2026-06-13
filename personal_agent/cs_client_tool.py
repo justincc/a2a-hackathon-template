@@ -52,14 +52,17 @@ async def ask_customer_service(message: str, tool_context: ToolContext) -> str:
         parts=[Part(root=TextPart(text=message))],
         context_id=session_id(tool_context),
     )
-    async with httpx.AsyncClient(timeout=_TIMEOUT_S) as http_client:
-        client = ClientFactory(
-            ClientConfig(streaming=False, httpx_client=http_client)
-        ).create(minimal_agent_card(CS_AGENT_URL, ["JSONRPC"]))
-        reply = ""
-        async for event in client.send_message(outgoing):
-            if isinstance(event, Message):
-                reply = _text_of_message(event) or reply
-            elif isinstance(event, tuple) and isinstance(event[0], Task):
-                reply = _text_of_task(event[0]) or reply
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_S) as http_client:
+            client = ClientFactory(
+                ClientConfig(streaming=False, httpx_client=http_client)
+            ).create(minimal_agent_card(CS_AGENT_URL, ["JSONRPC"]))
+            reply = ""
+            async for event in client.send_message(outgoing):
+                if isinstance(event, Message):
+                    reply = _text_of_message(event) or reply
+                elif isinstance(event, tuple) and isinstance(event[0], Task):
+                    reply = _text_of_task(event[0]) or reply
+    except Exception as e:
+        return f"[customer service unavailable: {e!r}]"
     return reply or "[no response from customer service]"
