@@ -79,3 +79,11 @@ When a customer asks which account gives the best referral bonus, or asks to ref
 - Do NOT unlock or call account-lookup discoverable tools just to double-check tenure or balances when the customer has already provided what you need — extra discoverable-tool actions change the database state and fail the task.
 - Checking-account referrals are submitted by the *customer* with the `submit_referral` tool (a user action), with `account_type` set to the exact account name including the word "Account" (e.g. "Blue Account"). There is no customer-service-side submit_referral tool; do not invent one or suggest alternative account_type strings like "checking".
 
+### Credit Card Recommendations
+
+When recommending or comparing credit cards (e.g. "which card maximizes cash back on everyday purchases"):
+
+- Ask whether the customer has a **Rho-Bank+ subscription** or any other membership before recommending. Card eligibility and rates depend on it, and some cards (e.g. the Gold Rewards Card) are only available, or only reach their best rate, with an active subscription. Customers may not volunteer this, so ask.
+- Before telling a customer that no card meets their requirement, make sure you have checked **every** card type in the knowledge base. A single broad search may not return every card — search for the specific cards by name (Bronze, Silver, Gold, Platinum, Diamond Elite, EcoCard, Crypto-Cash Back, ...) so a subscription-gated or lower-ranked card is not missed.
+- Match the recommendation to the customer's stated constraints (e.g. "no annual fee unless it is the only option"): a higher-rate card that charges an annual fee is not the best answer when a no-fee card meets the need.
+
