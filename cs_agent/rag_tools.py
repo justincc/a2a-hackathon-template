@@ -18,6 +18,10 @@ KB_INDEX = "kb_idx"
 DOC_PREFIX = "doc:"
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIM = 768
+# Default number of BM25 results (env-overridable, read at import). BM25 is the
+# primary retriever in the default CS_RETRIEVAL_MODE, so we return a few extra
+# docs to improve recall; set KB_BM25_TOP_K=5 to restore the original default.
+_DEFAULT_BM25_TOP_K = int(os.environ.get("KB_BM25_TOP_K", "8"))
 
 _client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
 _genai_client = None
@@ -77,7 +81,7 @@ def _strip_score(docs: list[dict]) -> list[dict]:
     return docs
 
 
-def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
+def kb_search_bm25(query: str, top_k: int = _DEFAULT_BM25_TOP_K) -> list[dict]:
     """Full-text (BM25) search over the Rho-Bank knowledge base.
 
     Args:

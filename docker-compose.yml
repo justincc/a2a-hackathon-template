@@ -28,6 +28,9 @@ services:
       ENV_API_TOKEN: ${CS_ENV_API_TOKEN:-dev-agent-token}
       REDIS_URL: redis://redis:6379/0
       MODEL: ${MODEL:-gemini-3.5-flash}
+      CS_RETRIEVAL_MODE: ${CS_RETRIEVAL_MODE:-bm25_primary}
+      KB_BM25_TOP_K: ${KB_BM25_TOP_K:-8}
+      KB_SKIP_EMBEDDINGS: ${KB_SKIP_EMBEDDINGS:-auto}
       GOOGLE_GENAI_USE_VERTEXAI: ${GOOGLE_GENAI_USE_VERTEXAI:-true}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
     extra_hosts:
