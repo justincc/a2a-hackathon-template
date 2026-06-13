@@ -27,15 +27,18 @@ def session_id(context: ReadonlyContext) -> str:
 
 
 async def _post_tool_call(sid: str, name: str, arguments: dict) -> dict:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            f"{ENV_API_URL}/sessions/{sid}/tools/{name}",
-            json={"arguments": arguments},
-            headers=_HEADERS,
-        )
-        if resp.status_code != 200:
-            return {"error": True, "content": f"HTTP {resp.status_code}: {resp.text}"}
-        return resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{ENV_API_URL}/sessions/{sid}/tools/{name}",
+                json={"arguments": arguments},
+                headers=_HEADERS,
+            )
+            if resp.status_code != 200:
+                return {"error": True, "content": f"HTTP {resp.status_code}: {resp.text}"}
+            return resp.json()
+    except Exception as e:
+        return {"error": True, "content": f"env tool call failed: {e!r}"}
 
 
 async def call_env_tool(
